@@ -1,603 +1,248 @@
-import os.path
-import tkinter as tk
-from PIL import Image, ImageTk
-import pickle
+import customtkinter as ctk
+from supabase import create_client, Client
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import base64
 
-main_root = tk.Tk()
-main_root.geometry('500x300+400+170')
+# Конфигурация supabase
+SUPABASE_URL = "https://pewgzzuazrxxbacllqnb.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBld2d6enVhenJ4eGJhY2xscW5iIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkzMjU0ODksImV4cCI6MjA4NDkwMTQ4OX0.64Pz3tS0VSTk7y7__mO1h69gRYWXThopFD2udZs022Y"
 
-
-def change_color_but(event):
-    event.widget['bg'] = '#D1D1D1'
-    event.widget['fg'] = 'Black'
-
-
-def reset_color_but(event):
-    event.widget['bg'] = '#222123'
-    event.widget['fg'] = '#D1D1D1'
+# Настройки интерфейса
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("dark-blue")
 
 
-# #363636
-main_background = tk.Frame(main_root, height=300, width=500, background='#222123')
-main_background.place(relheight=1, relwidth=1)
+class PasswordManager:
+    """Отвечает за общение с облаком и криптографию."""
 
-add_black_img = ImageTk.PhotoImage(Image.open('images/add_black.png').resize((35, 35)))
-add_white_img = ImageTk.PhotoImage(Image.open('images/add_white.png').resize((35, 35)))
-lock_img = ImageTk.PhotoImage(Image.open('images/lock.png').resize((110, 110)))
-arrow_img = ImageTk.PhotoImage(Image.open('images/arrow.png').resize((10, 10)))
-enter_black_img = ImageTk.PhotoImage(Image.open('images/enter_black.png').resize((15, 15)))
-enter_white_img = ImageTk.PhotoImage(Image.open('images/enter_white.png').resize((15, 15)))
-card_black_img = ImageTk.PhotoImage(Image.open('images/card_black.png').resize((15, 15)))
-card_white_img = ImageTk.PhotoImage(Image.open('images/card_white.png').resize((15, 15)))
-folder_black_img = ImageTk.PhotoImage(Image.open('images/folder_black.png').resize((15, 15)))
-folder_white_img = ImageTk.PhotoImage(Image.open('images/folder_white.png').resize((15, 15)))
-write_black_img = ImageTk.PhotoImage(Image.open('images/write_black.png').resize((15, 15)))
-write_white_img = ImageTk.PhotoImage(Image.open('images/write_white.png').resize((15, 15)))
+    def __init__(self):
+        self.supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        self.cipher = None
+        self.user = None  # Здесь будем хранить данные залогиненного юзера
 
-lock_img_lab = tk.Label(main_root, image=lock_img, background='#222123')
-lock_img_lab.place(x=190, y=90)
+    def generate_key_from_password(self, password: str, email: str) -> bytes:
+        """
+        Генерирует криптографический ключ на основе пароля.
+        Это позволяет не хранить файл ключа. Зная пароль и email,
+        мы всегда получим один и тот же ключ шифрования на любом устройстве.
+        """
+        # Используем email как "соль", чтобы одинаковые пароли у разных людей давали разные ключи
+        salt = email.encode()
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100_000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        return key
 
-dist = 5
-folders_files = {}
+    def login_user(self, email, password):
+        """Авторизация через Supabase Auth"""
+        try:
+            # 1. Логинимся в облако (получаем токен доступа)
+            response = self.supabase.auth.sign_in_with_password({
+                "email": email,
+                "password": password
+            })
+            self.user = response.user
+
+            # 2. Генерируем ключ шифрования из ТОГО ЖЕ пароля
+            # (или можно попросить отдельный мастер-пароль, но для удобства берем этот)
+            key = self.generate_key_from_password(password, email)
+            self.cipher = Fernet(key)
+            return True, "Успешно"
+        except Exception as e:
+            return False, str(e)
+
+    def register_user(self, email, password):
+        """Регистрация нового пользователя в облаке"""
+        try:
+            self.supabase.auth.sign_up({
+                "email": email,
+                "password": password
+            })
+            return True, "Регистрация успешна! Проверьте почту (если включено подтверждение) или входите."
+        except Exception as e:
+            return False, str(e)
+
+    def encrypt(self, text):
+        return self.cipher.encrypt(text.encode()).decode()
+
+    def decrypt(self, text):
+        try:
+            return self.cipher.decrypt(text.encode()).decode()
+        except Exception:
+            return "Error"
+
+    def fetch_passwords(self):
+        """Скачивает все пароли пользователя из облака"""
+        if not self.user:
+            return []
+
+        # Supabase сам фильтрует данные по user_id благодаря RLS
+        response = self.supabase.table("passwords").select("*").execute()
+        return response.data
+
+    def save_entry(self, title, login, password):
+        """Шифрует и отправляет в облако"""
+        if not self.user:
+            return
+
+        data = {
+            "user_id": self.user.id,  # Привязываем к юзеру
+            "service_name": title,
+            "login_enc": self.encrypt(login),
+            "password_enc": self.encrypt(password)
+        }
+        self.supabase.table("passwords").insert(data).execute()
 
 
-def add_write(e, name_folder, fold_root):
-    add_root = tk.Toplevel(main_root)
-    add_root.geometry('195x175+560+210')
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.manager = PasswordManager()
 
-    type_write = 'enter'
+        self.title("Password Manager")
+        self.geometry("700x500")
+        self.eval('tk::PlaceWindow . center')
 
-    def ok(e=None):
-        global folders_files
+        self.container = ctk.CTkFrame(self)
+        self.container.pack(fill="both", expand=True)
 
-        dist_wr = 0
-        write_title = title.get()
+        self.show_auth_screen()
 
-        def warn(text):
-            warning = tk.Toplevel(add_root)
-            warning.geometry('250x60+530+250')
-            warn_background = tk.Frame(warning, height=300, width=500, background='#D1D1D1')
-            warn_background.place(relheight=1, relwidth=1)
-            warn_lab = tk.Label(warning, text=text, background='#D1D1D1')
-            warn_lab.place(x=5, y=0)
+    def clear_frame(self):
+        """Очистка контейнера"""
+        for widget in self.container.winfo_children():
+            widget.destroy()
 
-        if os.path.exists(f'{name_folder}/{write_title}.txt'):
-            warn('Запись с таким названием уже существует')
+    def show_auth_screen(self):
+        """Экран авторизации (вход / регистрация)"""
+        self.clear_frame()
+        frame = ctk.CTkFrame(self.container)
+        frame.place(relx=0.5, rely=0.5, anchor="center")
+
+        ctk.CTkLabel(frame, text="Вход", font=("Arial", 20)).pack(pady=20, padx=40)
+
+        self.entry_email = ctk.CTkEntry(frame, width=250, placeholder_text="Email")
+        self.entry_email.pack(pady=10, padx=40)
+
+        self.entry_pass = ctk.CTkEntry(frame, width=250, show="*", placeholder_text="Master Password")
+        self.entry_pass.pack(pady=10, padx=40)
+
+        btn_login = ctk.CTkButton(frame, text="Вход", command=self.do_login)
+        btn_login.pack(pady=10)
+
+        btn_reg = ctk.CTkButton(frame, text="Регистрация", fg_color="transparent", border_width=1,
+                                command=self.do_register)
+        btn_reg.pack(pady=5)
+
+        self.lbl_status = ctk.CTkLabel(frame, text="", text_color="yellow")
+        self.lbl_status.pack(pady=10)
+
+    def do_login(self):
+        """Логика входа"""
+        email = self.entry_email.get()
+        pwd = self.entry_pass.get()
+        success, msg = self.manager.login_user(email, pwd)
+        if success:
+            self.show_main_screen()
         else:
-            write_but = tk.Button(fold_root, text=write_title, width=460, background='#222123',
-                                  foreground='#D1D1D1',
-                                  relief=tk.FLAT, activebackground='White', image=write_white_img,
-                                  compound=tk.LEFT,
-                                  padx=10, anchor='w', height=15)
-            write_but.bind('<Button-1>', lambda event: write(event))
-            write_but.bind('<Enter>', lambda event, picture=write_black_img: add_anim(event, picture, 'change'))
-            write_but.bind('<Leave>', lambda event, picture=write_white_img: add_anim(event, picture, 'reset'))
-            write_but.place(x=5, y=dist_wr)
-            dist_wr += 24
-            if type_write == 'enter':
-                login_get = login.get()
-                password_get = password.get()
-                add_root.destroy()
-                with open(f'{name_folder}/{write_title}.txt', 'w') as f:
-                    f.write(f'{login_get}\n{password_get}')
-                folders_files[write_title] = {write_title: [login_get, password_get]}
-            elif type_write == 'pay_card':
-                card_number_get = card_number.get()
-                pin_get = pin.get()
-                cvv_get = cvv.get()
-                term_get = term.get()
-                add_root.destroy()
-                with open(f'{name_folder}/{write_title}.txt', 'w') as f:
-                    f.write(f'{card_number_get}\n{pin_get}\n{cvv_get}\n{term_get}')
-                folders_files[write_title] = {write_title: [card_number_get, pin_get, cvv_get, term_get]}
-        with open('hierarchy.bin', 'wb') as directory:
-            pickle.dump(folders_files, directory)
-
-    def types_write_unlock(e=None):
-        if enter.winfo_viewable():
-            enter.place_forget()
-            pay_card.place_forget()
-        else:
-            enter.place(x=5, y=57)
-            pay_card.place(x=5, y=78)
-
-    def normal(e, widget, widget_text):
-        widget['state'] = 'normal'
-
-        if widget.get() == widget_text:
-            widget.delete(0, tk.END)
-            for wid, text in write_widgets.items():
-                if not wid.get() and widget is not wid:
-                    wid.insert(0, text)
-                    wid['state'] = 'disabled'
-        if type_write == 'enter':
-            ok_but['state'] = 'normal' if title.get() and login.get() and password.get() and \
-                                          title['state'].startswith('n') and login['state'].startswith('n') and \
-                                          password['state'].startswith('n') else 'disabled'
-        elif type_write == 'pay_card':
-            pass
-
-    def disabled_all(e):
-        for widget, text in write_widgets.items():
-            if not widget.get():
-                widget.insert(0, text)
-                widget['state'] = 'disabled'
-        enter.place_forget()
-        pay_card.place_forget()
-
-    def add_wr():
-        types_write_lab['text'] = 'Вход'
-        ok_but.place(x=130, y=145)
-        close_but.place(x=65, y=145)
-        title.place(x=5, y=65)
-        login.place(x=5, y=90)
-        password.place(x=5, y=115)
-        types_write_lab.place(x=5, y=35)
-        types_write_but.place(x=70, y=35)
-
-    def enter_type():
-        nonlocal type_write
-        add_root.geometry('195x175+560+210')
-        types_write_lab['text'] = 'Вход'
-        enter.place_forget()
-        pay_card.place_forget()
-        card_number.place_forget()
-        pin.place_forget()
-        cvv.place_forget()
-        term.place_forget()
-        login.place(x=5, y=90)
-        password.place(x=5, y=115)
-        ok_but.place(x=130, y=145)
-        close_but.place(x=65, y=145)
-        type_write = 'enter'
-
-    def pay_card_type():
-        nonlocal type_write
-        add_root.geometry('195x200+560+210')
-        types_write_lab['text'] = 'Карта'
-        enter.place_forget()
-        pay_card.place_forget()
-        login.place_forget()
-        password.place_forget()
-        card_number.place(x=5, y=90)
-        cvv.place(x=100, y=115)
-        term.place(x=5, y=115)
-        pin.place(x=5, y=140)
-        ok_but.place(x=130, y=170)
-        close_but.place(x=65, y=170)
-        type_write = 'pay_card'
-
-    background = tk.Frame(add_root, height=250, width=480, background='#363636')
-    background.place(relheight=1, relwidth=1)
-    background.bind('<Button-1>', disabled_all)
-
-    write_but = tk.Button(add_root, background='#363636', foreground='White', text='Запись', width=7, relief=tk.FLAT,
-                          command=add_wr, activebackground='#363636', activeforeground='White')
-    write_but.place(x=59, y=0)
-
-    ok_but = tk.Button(add_root, background='#222123', foreground='White', text='ок', width=7, relief=tk.FLAT,
-                       command=ok,
-                       state='disabled', activeforeground='White', activebackground='Black')
-
-    close_but = tk.Button(add_root, background='#222123', foreground='White', text='отмена', width=7, relief=tk.FLAT,
-                          activeforeground='White', activebackground='Black')
-
-    title = tk.Entry(add_root, background='#222123', foreground='White',
-                     disabledforeground='LightGrey', disabledbackground='#222123', state='disabled',
-                     insertbackground='White', width=30, relief=tk.FLAT)
-
-    login = tk.Entry(add_root, background='#222123', foreground='White',
-                     disabledforeground='LightGrey', disabledbackground='#222123', state='disabled',
-                     insertbackground='White', width=30, relief=tk.FLAT)
-
-    password = tk.Entry(add_root, background='#222123', foreground='White',
-                        disabledforeground='LightGrey', disabledbackground='#222123', state='disabled',
-                        insertbackground='White', width=30, relief=tk.FLAT)
-
-    card_number = tk.Entry(add_root, background='#222123', foreground='White',
-                           disabledforeground='LightGrey', disabledbackground='#222123', state='disabled',
-                           insertbackground='White', width=30, relief=tk.FLAT)
-
-    pin = tk.Entry(add_root, background='#222123', foreground='White',
-                   disabledforeground='LightGrey', disabledbackground='#222123', state='disabled',
-                   insertbackground='White', width=30, relief=tk.FLAT)
-
-    cvv = tk.Entry(add_root, background='#222123', foreground='White',
-                   disabledforeground='LightGrey', disabledbackground='#222123', state='disabled',
-                   insertbackground='White', width=14, relief=tk.FLAT)
-
-    term = tk.Entry(add_root, background='#222123', foreground='White', disabledforeground='LightGrey',
-                    disabledbackground='#222123', state='disabled', insertbackground='White', width=14, relief=tk.FLAT)
-
-    types_write_lab = tk.Label(add_root, text='Вход', width=10, background='#222123', foreground='White')
-    types_write_lab.bind('<Button-1>', types_write_unlock)
-
-    types_write_but = tk.Button(add_root, image=arrow_img, background='#222123', relief=tk.FLAT,
-                                activebackground='Black',
-                                width=15, height=15, command=types_write_unlock)
-
-    enter = tk.Button(add_root, image=enter_white_img, compound=tk.LEFT, width=60, background='#222123', relief=tk.FLAT,
-                      activebackground='White', text='Вход', foreground='White', activeforeground='Black', padx=10,
-                      anchor='w', height=13, command=enter_type)
-
-    enter.bind('<Enter>', lambda event, picture=enter_black_img: add_anim(event, picture, 'change'))
-    enter.bind('<Leave>', lambda event, picture=enter_white_img: add_anim(event, picture, 'reset'))
-
-    pay_card = tk.Button(add_root, image=card_white_img, compound=tk.LEFT, width=60, background='#222123',
-                         relief=tk.FLAT,
-                         activebackground='White', text='Карта', foreground='White', activeforeground='Black',
-                         padx=10, anchor='w', height=13, command=pay_card_type)
-
-    pay_card.bind('<Enter>', lambda event, picture=card_black_img: add_anim(event, picture, 'change'))
-    pay_card.bind('<Leave>', lambda event, picture=card_white_img: add_anim(event, picture, 'reset'))
-
-    write_widgets = {title: 'Название', login: 'Логин', password: 'Пароль',
-                     card_number: 'Номер карты', pin: 'ПИН-код', cvv: 'CVV-код', term: 'срок(мм/гг)'}
-
-    for w in write_widgets:
-        w.bind('<Button-1>', lambda event, widget=w, text=write_widgets[w]: normal(event, widget, text))
-        w.bind('<KeyRelease>', lambda event, widget=w, text=write_widgets[w]: normal(event, widget, text))
-        text_wid = tk.StringVar()
-        text_wid.set(write_widgets[w])
-        w['textvariable'] = text_wid
-    add_wr()
-
-
-def fold(e):
-    name_folder = e.widget['text']
-
-    folder_root = tk.Toplevel(main_root)
-
-    dist = 0
-    for name_write in folders_files[name_folder]:
-        write_in_folder = tk.Button(folder_root, text=name_write, width=69, background='Black', foreground='White',
-                                    relief=tk.FLAT)
-        write_in_folder.bind('<Button-1>', write)
-        write_in_folder.place(x=5, y=dist)
-        dist += 30
-    folder_root.geometry('400x200+450+225')
-    folder_root.title(name_folder)
-
-    background = tk.Frame(folder_root, height=300, width=500, background='#222123')
-    background.place(relheight=1, relwidth=1)
-
-    add_pass = tk.Button(folder_root, compound=tk.LEFT, padx=10, anchor='w', width=35,
-                         relief=tk.FLAT, background='#222123', activebackground='#222123', activeforeground='Black',
-                         foreground='White', image=add_white_img)
-    add_pass.place(x=350, y=152)
-    add_pass.bind('<Button-1>',
-                  lambda event, name_fold=name_folder, root=folder_root: add_write(event, name_fold, root))
-    add_pass.bind('<Enter>', lambda event, picture=add_black_img: add_anim(event, picture))
-    add_pass.bind('<Leave>', lambda event, picture=add_white_img: add_anim(event, picture))
-
-
-def write(e):
-    name_write = e.widget['text']
-
-    file_root = tk.Toplevel(main_root)
-    file_root.geometry('400x200+450+225')
-    file_root.title(name_write)
-
-    background = tk.Frame(file_root, height=300, width=500, background='#222123')
-    background.place(relheight=1, relwidth=1)
-
-    data_lab = tk.Label(file_root, background='#222123', foreground='White',
-                        text=f'Логин: {folders_files[name_write][name_write][0]}\nПароль: {folders_files[name_write][name_write][1]}')
-    data_lab.place(x=5, y=5)
-
-
-def main(start=(True,)):
-    global dist, folders_files
-    try:
-        with open('hierarchy.bin', 'rb') as directory:
-            direct = pickle.load(directory)
-        folders_files = direct
-        lock_img_lab.place_forget()
-        for name_write in direct:
-            if type(direct[name_write]) is dict:
-                write_but = tk.Button(main_root, text=name_write, width=460, background='#222123',
-                                      foreground='#D1D1D1',
-                                      relief=tk.FLAT, activebackground='White', image=write_white_img,
-                                      compound=tk.LEFT,
-                                      padx=10, anchor='w', height=15)
-                write_but.bind('<Button-1>', lambda event: write(event))
-                write_but.bind('<Enter>', lambda event, picture=write_black_img: add_anim(event, picture, 'change'))
-                write_but.bind('<Leave>', lambda event, picture=write_white_img: add_anim(event, picture, 'reset'))
-                write_but.place(x=5, y=dist)
-                dist += 24
-            else:
-                folder = tk.Button(main_root, text=name_write, width=460, background='#222123', foreground='#D1D1D1',
-                                   relief=tk.FLAT, activebackground='White', image=folder_white_img, compound=tk.LEFT,
-                                   padx=10, anchor='w', height=15)
-                folder.bind('<Button-1>', lambda event: fold(event))
-                folder.bind('<Enter>', lambda event, picture=folder_black_img: add_anim(event, picture, 'change'))
-                folder.bind('<Leave>', lambda event, picture=folder_white_img: add_anim(event, picture, 'reset'))
-                folder.place(x=5, y=dist)
-                dist += 24
-    except EOFError:
-        pass
-
-
-def add_anim(e, pic, change_color=''):
-    e.widget['image'] = pic
-    if change_color:
-        change_color_but(e) if change_color == 'change' else reset_color_but(e)
-
-
-def add():
-    add_root = tk.Toplevel(main_root)
-
-    type_add = 'folder'
-    type_write = 'enter'
-
-    def normal(e, widget, widget_text):
-        widget['state'] = 'normal'
-
-        if widget.get() == widget_text:
-            widget.delete(0, tk.END)
-            for wid, text in write_widgets.items():
-                if not wid.get() and widget is not wid:
-                    wid.insert(0, text)
-                    wid['state'] = 'disabled'
-        if widget is name_fold:
-            ok_but['state'] = 'normal' if name_fold.get() else 'disabled'
-        else:
-            if type_write == 'enter':
-                ok_but['state'] = 'normal' if title.get() and login.get() and password.get() and \
-                                              title['state'].startswith('n') and login['state'].startswith('n') and \
-                                              password['state'].startswith('n') else 'disabled'
-            elif type_write == 'pay_card':
-                pass
-
-    def warn(text):
-        warning = tk.Toplevel(add_root)
-        warning.geometry('250x60+530+250')
-        warn_background = tk.Frame(warning, height=300, width=500, background='#D1D1D1')
-        warn_background.place(relheight=1, relwidth=1)
-        warn_lab = tk.Label(warning, text=text, background='#D1D1D1')
-        warn_lab.place(x=5, y=0)
-
-        ok_warn_but = tk.Button(warning, background='#222123', foreground='White', text='понятно', width=7,
-                                relief=tk.FLAT, command=lambda warn=warning: warn.destroy())
-        ok_warn_but.place(x=5, y=25)
-
-    def ok(e=None):
-        global dist
-        global folders_files
-        name_fol = name_fold.get()
-        lock_img_lab.place_forget()
-        if type_add == 'folder' and name_fol:
-            if os.path.exists(name_fol):
-                warn('Папка с таким названием уже существует')
-            else:
-                folder = tk.Button(main_root, text=name_fol, width=460, background='#222123', foreground='#D1D1D1',
-                                   relief=tk.FLAT, activebackground='White', image=folder_white_img, compound=tk.LEFT,
-                                   padx=10, anchor='w', height=15)
-                folder.bind('<Button-1>', lambda event: fold(event))
-                folder.bind('<Enter>', lambda event, picture=folder_black_img: add_anim(event, picture, 'change'))
-                folder.bind('<Leave>', lambda event, picture=folder_white_img: add_anim(event, picture, 'reset'))
-                folder.place(x=5, y=dist)
-                dist += 24
-                add_root.destroy()
-                os.mkdir(name_fol)
-                folders_files[name_fol] = []
-        elif type_add == 'write':
-            write_title = title.get()
-            if os.path.exists(f'{write_title}.txt'):
-                warn('Запись с таким названием уже существует')
-            else:
-                write_but = tk.Button(main_root, text=write_title, width=460, background='#222123',
-                                      foreground='#D1D1D1',
-                                      relief=tk.FLAT, activebackground='White', image=write_white_img,
-                                      compound=tk.LEFT,
-                                      padx=10, anchor='w', height=15)
-                write_but.bind('<Button-1>', lambda event: write(event))
-                write_but.bind('<Enter>', lambda event, picture=write_black_img: add_anim(event, picture, 'change'))
-                write_but.bind('<Leave>', lambda event, picture=write_white_img: add_anim(event, picture, 'reset'))
-                write_but.place(x=5, y=dist)
-                dist += 24
-                if type_write == 'enter':
-                    login_get = login.get()
-                    password_get = password.get()
-                    add_root.destroy()
-                    with open(f'{write_title}.txt', 'w') as f:
-                        f.write(f'{login_get}\n{password_get}')
-                    folders_files[write_title] = {write_title: [login_get, password_get]}
-                elif type_write == 'pay_card':
-                    card_number_get = card_number.get()
-                    pin_get = pin.get()
-                    cvv_get = cvv.get()
-                    term_get = term.get()
-                    add_root.destroy()
-                    with open(f'{write_title}.txt', 'w') as f:
-                        f.write(f'{card_number_get}\n{pin_get}\n{cvv_get}\n{term_get}')
-                    folders_files[write_title] = {write_title: [card_number_get, pin_get, cvv_get, term_get]}
-        with open('hierarchy.bin', 'wb') as directory:
-            pickle.dump(folders_files, directory)
-
-    def disabled_all(e):
-        for widget, text in write_widgets.items():
-            if not widget.get():
-                widget.insert(0, text)
-                widget['state'] = 'disabled'
-        enter.place_forget()
-        pay_card.place_forget()
-
-    def add_wr():
-        nonlocal type_add
-        add_root.geometry('195x175+560+210')
-        types_write_lab['text'] = 'Вход'
-        write_but['bg'] = '#363636'
-        folder_but['bg'] = '#222123'
-        name_fold.place_forget()
-        ok_but.place(x=130, y=145)
-        close_but.place(x=65, y=145)
-        title.place(x=5, y=65)
-        login.place(x=5, y=90)
-        password.place(x=5, y=115)
-        types_write_lab.place(x=5, y=35)
-        types_write_but.place(x=70, y=35)
-        type_add = 'write'
-
-    def add_folder():
-        nonlocal type_add
-        add_root.geometry('195x103+560+210')
-        write_but['bg'] = '#222123'
-        folder_but['bg'] = '#363636'
-        title.place_forget()
-        types_write_lab.place_forget()
-        types_write_but.place_forget()
-        login.place_forget()
-        password.place_forget()
-        pin.place_forget()
-        card_number.place_forget()
-        cvv.place_forget()
-        term.place_forget()
-        ok_but.place(x=130, y=70)
-        close_but.place(x=65, y=70)
-        name_fold.place(x=5, y=40)
-        type_add = 'folder'
-
-    def types_write_unlock(e=None):
-        if enter.winfo_viewable():
-            enter.place_forget()
-            pay_card.place_forget()
-        else:
-            enter.place(x=5, y=57)
-            pay_card.place(x=5, y=78)
-
-    def enter_type():
-        nonlocal type_write
-        add_root.geometry('195x175+560+210')
-        types_write_lab['text'] = 'Вход'
-        enter.place_forget()
-        pay_card.place_forget()
-        card_number.place_forget()
-        pin.place_forget()
-        cvv.place_forget()
-        term.place_forget()
-        login.place(x=5, y=90)
-        password.place(x=5, y=115)
-        ok_but.place(x=130, y=145)
-        close_but.place(x=65, y=145)
-        type_write = 'enter'
-
-    def pay_card_type():
-        nonlocal type_write
-        add_root.geometry('195x200+560+210')
-        types_write_lab['text'] = 'Карта'
-        enter.place_forget()
-        pay_card.place_forget()
-        login.place_forget()
-        password.place_forget()
-        card_number.place(x=5, y=90)
-        cvv.place(x=100, y=115)
-        term.place(x=5, y=115)
-        pin.place(x=5, y=140)
-        ok_but.place(x=130, y=170)
-        close_but.place(x=65, y=170)
-        type_write = 'pay_card'
-
-    add_root.geometry('170x120+410+210')
-    add_root.title('Добавить')
-
-    background = tk.Frame(add_root, height=250, width=480, background='#363636')
-    background.place(relheight=1, relwidth=1)
-    background.bind('<Button-1>', disabled_all)
-
-    folder_but = tk.Button(add_root, background='#363636', foreground='White', text='Папка', width=7, relief=tk.FLAT,
-                           command=add_folder, activebackground='#363636', activeforeground='White')
-    folder_but.place(x=0, y=0)
-    write_but = tk.Button(add_root, background='#222123', foreground='White', text='Запись', width=7, relief=tk.FLAT,
-                          command=add_wr, activebackground='#363636', activeforeground='White')
-    write_but.place(x=59, y=0)
-
-    ok_but = tk.Button(add_root, background='#222123', foreground='White', text='ок', width=7, relief=tk.FLAT,
-                       command=ok,
-                       state='disabled', activeforeground='White', activebackground='Black')
-
-    close_but = tk.Button(add_root, background='#222123', foreground='White', text='отмена', width=7, relief=tk.FLAT,
-                          activeforeground='White', activebackground='Black')
-
-    name_fold = tk.Entry(add_root, background='#222123', state='disabled',
-                         disabledforeground='LightGrey', disabledbackground='#222123', foreground='White',
-                         insertbackground='White', width=30, relief=tk.FLAT)
-    name_fold.place(x=5, y=50)
-    name_fold.bind('<Return>', ok)
-
-    # поля в разделе добавить запись
-
-    title = tk.Entry(add_root, background='#222123', foreground='White',
-                     disabledforeground='LightGrey', disabledbackground='#222123', state='disabled',
-                     insertbackground='White', width=30, relief=tk.FLAT)
-
-    login = tk.Entry(add_root, background='#222123', foreground='White',
-                     disabledforeground='LightGrey', disabledbackground='#222123', state='disabled',
-                     insertbackground='White', width=30, relief=tk.FLAT)
-
-    password = tk.Entry(add_root, background='#222123', foreground='White',
-                        disabledforeground='LightGrey', disabledbackground='#222123', state='disabled',
-                        insertbackground='White', width=30, relief=tk.FLAT)
-
-    card_number = tk.Entry(add_root, background='#222123', foreground='White',
-                           disabledforeground='LightGrey', disabledbackground='#222123', state='disabled',
-                           insertbackground='White', width=30, relief=tk.FLAT)
-
-    pin = tk.Entry(add_root, background='#222123', foreground='White',
-                   disabledforeground='LightGrey', disabledbackground='#222123', state='disabled',
-                   insertbackground='White', width=30, relief=tk.FLAT)
-
-    cvv = tk.Entry(add_root, background='#222123', foreground='White',
-                   disabledforeground='LightGrey', disabledbackground='#222123', state='disabled',
-                   insertbackground='White', width=14, relief=tk.FLAT)
-
-    term = tk.Entry(add_root, background='#222123', foreground='White', disabledforeground='LightGrey',
-                    disabledbackground='#222123', state='disabled', insertbackground='White', width=14, relief=tk.FLAT)
-
-    # дальше не поля
-
-    types_write_lab = tk.Label(add_root, text='Вход', width=10, background='#222123', foreground='White')
-    types_write_lab.bind('<Button-1>', types_write_unlock)
-
-    types_write_but = tk.Button(add_root, image=arrow_img, background='#222123', relief=tk.FLAT,
-                                activebackground='Black',
-                                width=15, height=15, command=types_write_unlock)
-
-    enter = tk.Button(add_root, image=enter_white_img, compound=tk.LEFT, width=60, background='#222123', relief=tk.FLAT,
-                      activebackground='White', text='Вход', foreground='White', activeforeground='Black', padx=10,
-                      anchor='w', height=13, command=enter_type)
-
-    enter.bind('<Enter>', lambda event, picture=enter_black_img: add_anim(event, picture, 'change'))
-    enter.bind('<Leave>', lambda event, picture=enter_white_img: add_anim(event, picture, 'reset'))
-
-    pay_card = tk.Button(add_root, image=card_white_img, compound=tk.LEFT, width=60, background='#222123',
-                         relief=tk.FLAT,
-                         activebackground='White', text='Карта', foreground='White', activeforeground='Black',
-                         padx=10, anchor='w', height=13, command=pay_card_type)
-
-    pay_card.bind('<Enter>', lambda event, picture=card_black_img: add_anim(event, picture, 'change'))
-    pay_card.bind('<Leave>', lambda event, picture=card_white_img: add_anim(event, picture, 'reset'))
-
-    write_widgets = {name_fold: 'Название папки', title: 'Название', login: 'Логин', password: 'Пароль',
-                     card_number: 'Номер карты', pin: 'ПИН-код', cvv: 'CVV-код', term: 'срок(мм/гг)'}
-
-    for w in write_widgets:
-        w.bind('<Button-1>', lambda event, widget=w, text=write_widgets[w]: normal(event, widget, text))
-        w.bind('<KeyRelease>', lambda event, widget=w, text=write_widgets[w]: normal(event, widget, text))
-        text_wid = tk.StringVar()
-        text_wid.set(write_widgets[w])
-        w['textvariable'] = text_wid
-
-    add_folder()
-
-
-add_wr_but = tk.Button(main_root, compound=tk.LEFT, padx=10, anchor='w', width=35,
-                       relief=tk.FLAT, background='#222123', activebackground='#222123',
-                       foreground='White', command=add, image=add_white_img)
-add_wr_but.place(x=450, y=252)
-add_wr_but.bind('<Enter>', lambda event, picture=add_black_img: add_anim(event, picture))
-add_wr_but.bind('<Leave>', lambda event, picture=add_white_img: add_anim(event, picture))
-
-main()
-
-main_root.mainloop()
+            self.lbl_status.configure(text=f"Ошибка: {msg}")
+
+    def do_register(self):
+        """Логика регистрации"""
+        email = self.entry_email.get()
+        pwd = self.entry_pass.get()
+        success, msg = self.manager.register_user(email, pwd)
+        self.lbl_status.configure(text=msg)
+
+    def show_main_screen(self):
+        """Экран с паролями"""
+        self.clear_frame()
+
+        # Левая панель
+        self.sidebar = ctk.CTkScrollableFrame(self.container, width=200, label_text="Мои сервисы")
+        self.sidebar.pack(side="left", fill="y", padx=10, pady=10)
+
+        # Правая панель
+        self.content = ctk.CTkFrame(self.container)
+        self.content.pack(side="right", fill="both", expand=True, padx=10, pady=10)
+
+        add_btn = ctk.CTkButton(self.content, text="+ Добавить", command=self.show_add_form)
+        add_btn.pack(pady=10, padx=10, fill="x")
+
+        self.info_frame = ctk.CTkFrame(self.content)
+        self.info_frame.pack(fill="both", expand=True, pady=10)
+
+        self.label_title = ctk.CTkLabel(self.info_frame, text="Выберите запись", font=("Arial", 18))
+        self.label_title.pack(pady=20)
+
+        self.label_login = ctk.CTkLabel(self.info_frame, text="")
+        self.label_login.pack(pady=5)
+
+        self.label_pass = ctk.CTkLabel(self.info_frame, text="")
+        self.label_pass.pack(pady=5)
+
+        self.refresh_list()
+
+    def refresh_list(self):
+        """Обновление записей"""
+        # Очистка старых кнопок из левой панели
+        for widget in self.sidebar.winfo_children():
+            widget.destroy()
+
+        # Загрузка из облака
+        data_list = self.manager.fetch_passwords()
+
+        for entry in data_list:
+            service_name = entry['service_name']
+            # Передаем весь объект entry, чтобы не искать его снова
+            btn = ctk.CTkButton(self.sidebar, text=service_name, fg_color="transparent", border_width=1,
+                                command=lambda e=entry: self.show_details(e))
+            btn.pack(pady=2, fill="x")
+
+    def show_details(self, entry):
+        """Экран показа всей информации по выбранной записи"""
+        # Дешифруем полученные данные
+        dec_login = self.manager.decrypt(entry['login_enc'])
+        dec_pass = self.manager.decrypt(entry['password_enc'])
+
+        self.label_title.configure(text=entry['service_name'])
+        self.label_login.configure(text=f"Логин: {dec_login}")
+        self.label_pass.configure(text=f"Пароль: {dec_pass}")
+
+    def show_add_form(self):
+        """Экран добавления записи"""
+        window = ctk.CTkToplevel(self)
+        window.geometry("300x350")
+        window.title("Добавить")
+        window.attributes('-topmost', True)
+
+        ctk.CTkLabel(window, text="Сервис:").pack(pady=5)
+        e_title = ctk.CTkEntry(window)
+        e_title.pack(pady=5)
+
+        ctk.CTkLabel(window, text="Логин:").pack(pady=5)
+        e_login = ctk.CTkEntry(window)
+        e_login.pack(pady=5)
+
+        ctk.CTkLabel(window, text="Пароль:").pack(pady=5)
+        e_pass = ctk.CTkEntry(window)
+        e_pass.pack(pady=5)
+
+        def save():
+            if e_title.get() and e_pass.get():
+                self.manager.save_entry(e_title.get(), e_login.get(), e_pass.get())
+                self.refresh_list()
+                window.destroy()
+
+        ctk.CTkButton(window, text="Сохранить", command=save).pack(pady=20)
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
